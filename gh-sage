@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# gh-sage — Sage AI for GitHub CLI
+# Install: gh extension install sageworksai/gh-sage
+# Requires: sage CLI (pip install sage-ai-cli)
+
+set -euo pipefail
+
+SUBCOMMAND="${1:-help}"
+shift || true
+
+_require_sage() {
+  if ! command -v sage >/dev/null 2>&1; then
+    echo "❌ sage CLI not found. Install it:"
+    echo "   pip install sage-ai-cli && sage login"
+    exit 1
+  fi
+}
+
+_model_flags() {
+  local model="${SAGE_MODEL:-}"
+  if [ -z "$model" ]; then
+    local cfg="$HOME/.sage/config.json"
+    if [ -f "$cfg" ]; then
+      model=$(python3 -c "import json; print(json.load(open('$cfg')).get('default_model',''))" 2>/dev/null || true)
+    fi
+  fi
+  if [ -n "$model" ]; then echo "--model $model"; else echo ""; fi
+}
+
+case "$SUBCOMMAND" in
+
+  # ── Generate a PR description ─────────────────────────────────────────
+  pr|pull-request)
+    _require_sage
+    BASE="${1:-main}"
+    BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")
+    COMMITS=$(git log --oneline "origin/${BASE}...${BRANCH}" 2>/dev/null | head -30 || echo "")
+    STATS=$(git diff "origin/${BASE}...${BRANCH}" --stat 2>/dev/null | tail -5 || echo "")
+    if [ -z "$COMMITS" ]; then
+      echo "No commits ahead of origin/${BASE}."
+      exit 0
+    fi
+    echo "⟡ Generating PR description for ${BRANCH}..."
+    read -r -d '' PROMPT <<PROMPT_EOF || true
+Write a GitHub pull request description with these sections:
+## Summary (2-3 sentences)
+## Changes (bullet list)
+## Testing (how to verify)
+
+Branch: ${BRANCH}
+Base: ${BASE}
+
+Commits:
+${COMMITS}
+
+Diff stats:
+${STATS}
+PROMPT_EOF
+    # shellcheck disable=SC2046
+    sage ask $(eval echo "$(_model_flags)") --raw "$PROMPT"
+    ;;
+
+  # ── AI code review of a PR ────────────────────────────────────────────
+  review)
+    _require_sage
+    PR_NUMBER="${1:-}"
+    if [ -z "$PR_NUMBER" ]; then
+      PR_NUMBER=$(gh pr view --json number -q .number 2>/dev/null || echo "")
+    fi
+    [ -n "$PR_NUMBER" ] || { echo "Usage: gh sage review <pr-number>"; exit 1; }
+    echo "⟡ Reviewing PR #${PR_NUMBER}..."
+    DIFF=$(gh pr diff "$PR_NUMBER" | head -500)
+    # shellcheck disable=SC2046
+    sage ask $(eval echo "$(_model_flags)") --raw "Review this pull request diff. Note: correctness issues, security concerns, missing tests, style problems. Be specific and actionable.
+
+$DIFF"
+    ;;
+
+  # ── Generate commit message from staged diff ──────────────────────────
+  commit)
+    _require_sage
+    DIFF=$(git diff --staged 2>/dev/null)
+    [ -n "$DIFF" ] || { echo "No staged changes. Run: git add <files>"; exit 1; }
+    echo "⟡ Generating commit message..."
+    # shellcheck disable=SC2046
+    sage ask $(eval echo "$(_model_flags)") --raw "Write a git commit message (conventional commits format: type(scope): subject, then blank line, then bullet body). For:
+
+$DIFF"
+    ;;
+
+  # ── Explain a file or PR diff ─────────────────────────────────────────
+  explain)
+    _require_sage
+    TARGET="${1:-}"
+    if [ -z "$TARGET" ]; then
+      echo "Usage: gh sage explain <file> | gh sage explain <pr-number>"
+      exit 1
+    fi
+    if [[ "$TARGET" =~ ^[0-9]+$ ]]; then
+      echo "⟡ Explaining PR #${TARGET}..."
+      DIFF=$(gh pr diff "$TARGET" | head -300)
+      # shellcheck disable=SC2046
+      sage ask $(eval echo "$(_model_flags)") --raw "Explain what this pull request does in plain English, and why these changes were made:
+
+$DIFF"
+    elif [ -f "$TARGET" ]; then
+      echo "⟡ Explaining ${TARGET}..."
+      # shellcheck disable=SC2046
+      sage ask $(eval echo "$(_model_flags)") --file "$TARGET" "Explain this file clearly."
+    else
+      echo "❌ Not found: $TARGET (expected a file path or PR number)"
+      exit 1
+    fi
+    ;;
+
+  # ── Draft a GitHub issue ──────────────────────────────────────────────
+  issue)
+    _require_sage
+    TASK="${*}"
+    if [ -z "$TASK" ]; then
+      read -r -p "Describe the issue: " TASK
+    fi
+    echo "⟡ Drafting issue..."
+    # shellcheck disable=SC2046
+    sage ask $(eval echo "$(_model_flags)") --raw "Write a GitHub issue report with these sections:
+**Title**: (one line)
+**Description**: (what the problem is)
+**Steps to Reproduce**: (numbered list)
+**Expected Behavior**:
+**Actual Behavior**:
+**Environment**: (OS, version, etc.)
+
+For: $TASK"
+    ;;
+
+  # ── Run a full agentic task in the repo ───────────────────────────────
+  run)
+    _require_sage
+    TASK="${*}"
+    if [ -z "$TASK" ]; then
+      read -r -p "Task for sage: " TASK
+    fi
+    echo "⟡ Running sage agent on: $TASK"
+    # shellcheck disable=SC2046
+    sage run $(eval echo "$(_model_flags)") --prompt "$TASK"
+    ;;
+
+  # ── List available models ─────────────────────────────────────────────
+  models)
+    _require_sage
+    sage models --all
+    ;;
+
+  # ── Help ──────────────────────────────────────────────────────────────
+  help|--help|-h)
+    cat <<'HELP'
+gh-sage — Sage AI for GitHub CLI
+
+Commands:
+  gh sage pr [base]          Generate a PR description (default base: main)
+  gh sage review [pr-num]    AI code review of a pull request
+  gh sage commit             Generate a commit message from staged diff
+  gh sage explain <file|pr>  Explain a file or PR diff
+  gh sage issue <desc>       Draft a GitHub issue
+  gh sage run <task>         Run full agentic task in current repo
+  gh sage models             List available AI models
+
+Environment:
+  SAGE_MODEL=cloud:mistral-small  Override the model for this command
+
+Requires: sage CLI — pip install sage-ai-cli && sage login
+HELP
+    ;;
+
+  *)
+    echo "Unknown command: $SUBCOMMAND. Run: gh sage help"
+    exit 1
+    ;;
+esac
